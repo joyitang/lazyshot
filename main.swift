@@ -2,8 +2,8 @@ import AppKit
 import Foundation
 
 // Shift-Command-4 → system writes Desktop file.
-// We convert to clipboard-first UX: copy to pasteboard, remove Desktop file,
-// show float. 复制/timeout = clipboard only; 存桌面 = write PNG.
+// Clipboard-first UX + share: 复制 / 存桌面 / 飞书 / 微信
+// 飞书·微信 = pasteboard + activate app (user pastes).
 
 final class OverlayController: NSObject {
     private var panel: NSPanel?
@@ -19,7 +19,11 @@ final class OverlayController: NSObject {
     private var pollTimer: Timer?
     private var dismissTimer: Timer?
     private var ignorePasteboardUntil: Date?
-    private let autoDismissSeconds: TimeInterval = 3.5
+    private let autoDismissSeconds: TimeInterval = 5
+
+    // Mac apps on JOY's machine
+    private let feishuBundleIDs = ["com.electron.lark", "com.larksuite.lark", "com.bytedance.macos.feishu"]
+    private let wechatBundleIDs = ["com.tencent.xinWeChat"]
 
     override init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -51,7 +55,6 @@ final class OverlayController: NSObject {
     private func isScreenshot(_ url: URL) -> Bool {
         let name = url.lastPathComponent
         if name.hasPrefix(".") { return false }
-        // Skip files we ourselves saved via 存桌面
         if name.hasPrefix("截屏浮窗") { return false }
         let ext = url.pathExtension.lowercased()
         guard ["png", "jpg", "jpeg"].contains(ext) else { return false }
@@ -138,13 +141,11 @@ final class OverlayController: NSObject {
                 return
             }
 
-            // Clipboard-first: pasteboard first, then remove Desktop original
             self.writePasteboard(image)
             do {
                 try FileManager.default.removeItem(at: url)
             } catch {
                 NSLog("remove screenshot failed: \(error)")
-                // Still proceed — user at least has clipboard + float
             }
 
             self.pendingNames.remove(name)
@@ -176,7 +177,7 @@ final class OverlayController: NSObject {
         imageView?.image = image
 
         if let screen = NSScreen.main {
-            let size = NSSize(width: 280, height: 220)
+            let size = NSSize(width: 300, height: 258)
             let margin: CGFloat = 24
             let origin = NSPoint(
                 x: screen.visibleFrame.maxX - size.width - margin,
@@ -194,14 +195,15 @@ final class OverlayController: NSObject {
     private func resetDismissTimer() {
         dismissTimer?.invalidate()
         dismissTimer = Timer.scheduledTimer(withTimeInterval: autoDismissSeconds, repeats: false) { [weak self] _ in
-            // Timeout: clipboard only, no file
             self?.panel?.orderOut(nil)
         }
     }
 
     private func buildPanel() {
+        let w: CGFloat = 300
+        let h: CGFloat = 258
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 280, height: 220),
+            contentRect: NSRect(x: 0, y: 0, width: w, height: h),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -216,7 +218,7 @@ final class OverlayController: NSObject {
         panel.worksWhenModal = true
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
 
-        let chrome = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 280, height: 220))
+        let chrome = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         chrome.material = .hudWindow
         chrome.blendingMode = .behindWindow
         chrome.state = .active
@@ -225,7 +227,8 @@ final class OverlayController: NSObject {
         chrome.layer?.masksToBounds = true
         chrome.autoresizingMask = [.width, .height]
 
-        let imageView = NSImageView(frame: NSRect(x: 12, y: 52, width: 256, height: 156))
+        // Image above two button rows
+        let imageView = NSImageView(frame: NSRect(x: 12, y: 88, width: w - 24, height: 158))
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.wantsLayer = true
         imageView.layer?.cornerRadius = 8
@@ -234,15 +237,24 @@ final class OverlayController: NSObject {
         chrome.addSubview(imageView)
         self.imageView = imageView
 
-        let copyBtn = NSButton(title: "复制", target: self, action: #selector(keepClipboard))
-        copyBtn.frame = NSRect(x: 12, y: 12, width: 120, height: 28)
-        copyBtn.bezelStyle = .rounded
-        chrome.addSubview(copyBtn)
+        let btnH: CGFloat = 28
+        let gap: CGFloat = 8
+        let side: CGFloat = 12
+        let btnW = (w - side * 2 - gap) / 2
 
-        let saveBtn = NSButton(title: "存桌面", target: self, action: #selector(saveToDesktop))
-        saveBtn.frame = NSRect(x: 148, y: 12, width: 120, height: 28)
-        saveBtn.bezelStyle = .rounded
-        chrome.addSubview(saveBtn)
+        func addBtn(title: String, x: CGFloat, y: CGFloat, action: Selector) {
+            let b = NSButton(title: title, target: self, action: action)
+            b.frame = NSRect(x: x, y: y, width: btnW, height: btnH)
+            b.bezelStyle = .rounded
+            chrome.addSubview(b)
+        }
+
+        // Bottom row: 飞书 / 微信
+        addBtn(title: "飞书", x: side, y: 12, action: #selector(shareFeishu))
+        addBtn(title: "微信", x: side + btnW + gap, y: 12, action: #selector(shareWechat))
+        // Upper row: 复制 / 存桌面
+        addBtn(title: "复制", x: side, y: 12 + btnH + gap, action: #selector(keepClipboard))
+        addBtn(title: "存桌面", x: side + btnW + gap, y: 12 + btnH + gap, action: #selector(saveToDesktop))
 
         panel.contentView = chrome
         self.panel = panel
@@ -262,7 +274,6 @@ final class OverlayController: NSObject {
         guard let image = currentImage else { return }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-        // Prefix 截屏浮窗 so watcher won't re-claim it
         let name = "截屏浮窗 \(formatter.string(from: Date())).png"
         let dest = desktopURL.appendingPathComponent(name)
         guard let tiff = image.tiffRepresentation,
@@ -278,6 +289,48 @@ final class OverlayController: NSObject {
         writePasteboard(image)
         dismissTimer?.invalidate()
         panel?.orderOut(nil)
+    }
+
+    @objc private func shareFeishu() {
+        share(toBundleIDs: feishuBundleIDs, label: "飞书")
+    }
+
+    @objc private func shareWechat() {
+        share(toBundleIDs: wechatBundleIDs, label: "微信")
+    }
+
+    private func share(toBundleIDs ids: [String], label: String) {
+        guard let image = currentImage else { return }
+        writePasteboard(image)
+        dismissTimer?.invalidate()
+        panel?.orderOut(nil)
+
+        let ok = activateApp(bundleIDs: ids)
+        if !ok {
+            NSLog("share: could not open \(label)")
+            // Still leave image on clipboard
+        }
+    }
+
+    private func activateApp(bundleIDs: [String]) -> Bool {
+        let ws = NSWorkspace.shared
+        for id in bundleIDs {
+            if let urls = ws.urlForApplication(withBundleIdentifier: id) {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                ws.openApplication(at: urls, configuration: config) { _, error in
+                    if let error { NSLog("open \(id) failed: \(error)") }
+                }
+                return true
+            }
+            // Fallback: already running?
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            if let app = running.first {
+                app.activate(options: [.activateIgnoringOtherApps])
+                return true
+            }
+        }
+        return false
     }
 
     private func writePasteboard(_ image: NSImage) {
