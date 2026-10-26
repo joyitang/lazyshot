@@ -14,7 +14,7 @@ enum AnnoTool: Int {
     case text = 3
 }
 
-enum Annotation {
+enum Annotation: Equatable {
     case rect(NSRect)
     case arrow(from: NSPoint, to: NSPoint)
     case text(string: String, origin: NSPoint, fontSize: CGFloat)
@@ -68,6 +68,17 @@ final class AnnotationCanvasView: NSView {
         }
     }
     var onEditingChanged: (() -> Void)?
+
+    // MARK: Undo (edit-window only; cleared on reset / close)
+    private struct EditSnapshot {
+        let annotations: [Annotation]
+        let cropRect: NSRect?
+        let selectedAnnoIndex: Int?
+    }
+    private var undoStack: [EditSnapshot] = []
+    /// Captured at mouseDown for a mutating gesture; pushed on mouseUp if state changed.
+    private var undoBaseline: EditSnapshot?
+    private let maxUndoLevels = 50
 
     private var drag: CanvasDrag = .none
     private var dragStart: NSPoint?
@@ -522,12 +533,99 @@ final class AnnotationCanvasView: NSView {
         }
     }
 
+    // MARK: Undo
+
+    private func currentSnapshot() -> EditSnapshot {
+        EditSnapshot(
+            annotations: annotations,
+            cropRect: cropRect,
+            selectedAnnoIndex: selectedAnnoIndex
+        )
+    }
+
+    private func beginUndoGroup() {
+        undoBaseline = currentSnapshot()
+    }
+
+    private func endUndoGroup() {
+        guard let before = undoBaseline else { return }
+        undoBaseline = nil
+        let after = currentSnapshot()
+        guard before.annotations != after.annotations
+                || before.cropRect != after.cropRect
+                || before.selectedAnnoIndex != after.selectedAnnoIndex else {
+            return
+        }
+        undoStack.append(before)
+        if undoStack.count > maxUndoLevels {
+            undoStack.removeFirst(undoStack.count - maxUndoLevels)
+        }
+    }
+
+    private func pushUndoSnapshot(_ before: EditSnapshot) {
+        let after = currentSnapshot()
+        guard before.annotations != after.annotations
+                || before.cropRect != after.cropRect
+                || before.selectedAnnoIndex != after.selectedAnnoIndex else {
+            return
+        }
+        undoStack.append(before)
+        if undoStack.count > maxUndoLevels {
+            undoStack.removeFirst(undoStack.count - maxUndoLevels)
+        }
+    }
+
+    func clearUndoStack() {
+        undoStack.removeAll()
+        undoBaseline = nil
+    }
+
+    /// True while the on-canvas text field is up (typing / IME).
+    var isEditingText: Bool { textField != nil }
+
+    /// Pop one edit. Empty stack = no-op. Returns true if an undo ran or empty-stack no-op was handled.
+    @discardableResult
+    func undoLastEdit() -> Bool {
+        // While typing, text field owns ⌘Z — callers should not reach here.
+        if textField != nil { return false }
+        guard let snap = undoStack.popLast() else { return true }
+        annotations = snap.annotations
+        cropRect = snap.cropRect
+        selectedAnnoIndex = snap.selectedAnnoIndex
+        drag = .none
+        dragStart = nil
+        dragCurrent = nil
+        undoBaseline = nil
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+        onEditingChanged?()
+        return true
+    }
+
+    static func isCommandZ(_ event: NSEvent) -> Bool {
+        // Plain ⌘Z only (ignore caps lock; no ⇧/⌥/⌃ → no redo)
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard flags == .command else { return false }
+        return event.charactersIgnoringModifiers?.lowercased() == "z"
+    }
+
+    /// ⌘Z when canvas is first responder. While the text field / field editor is FR,
+    /// AppKit delivers keys there instead — so typing & field-undo stay untouched.
+    override func keyDown(with event: NSEvent) {
+        if Self.isCommandZ(event) {
+            _ = undoLastEdit()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
     // MARK: Mouse
 
     override func mouseDown(with event: NSEvent) {
         commitTextIfNeeded()
         let p = convert(event.locationInWindow, from: nil)
         onEditingChanged?()
+        // Same as pre-undo: canvas takes FR first; beginTextEdit then moves FR to the field.
         window?.makeFirstResponder(self)
 
         if tool == .crop {
@@ -535,17 +633,20 @@ final class AnnotationCanvasView: NSView {
             guard imageDrawRect().contains(p) || cropRect != nil else { return }
             if let h = hitCropHandle(at: p), let cr = cropRect,
                let imgPt = viewToImage(p, clamp: true) {
+                beginUndoGroup()
                 drag = .resizeCrop(handle: h, startMouse: imgPt, startRect: cr)
                 return
             }
             if let cr = cropRect {
                 let vr = imageRectToView(cr)
                 if vr.contains(p), let imgPt = viewToImage(p, clamp: true) {
+                    beginUndoGroup()
                     drag = .moveCrop(startMouse: imgPt, startRect: cr)
                     return
                 }
             }
             // Click outside existing crop → new selection
+            beginUndoGroup()
             dragStart = p
             dragCurrent = p
             drag = .createCrop
@@ -574,11 +675,13 @@ final class AnnotationCanvasView: NSView {
                let h = hitAnnoRectHandle(index: idx, at: p),
                case .rect(let ir) = annotations[idx],
                let imgPt = viewToImage(p, clamp: true) {
+                beginUndoGroup()
                 drag = .resizeAnnoRect(index: idx, handle: h, startMouse: imgPt, startRect: ir)
                 return
             }
             if let idx = hitAnnotationIndex(at: p), let imgPt = viewToImage(p, clamp: true) {
                 selectedAnnoIndex = idx
+                beginUndoGroup()
                 drag = .moveAnno(index: idx, startMouse: imgPt, original: annotations[idx])
                 needsDisplay = true
                 return
@@ -589,6 +692,7 @@ final class AnnotationCanvasView: NSView {
         switch tool {
         case .rect, .arrow:
             guard imageDrawRect().contains(p) else { return }
+            beginUndoGroup()
             dragStart = p
             dragCurrent = p
             drag = .createAnno
@@ -633,6 +737,7 @@ final class AnnotationCanvasView: NSView {
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         defer {
+            endUndoGroup()
             drag = .none
             dragStart = nil
             dragCurrent = nil
@@ -824,6 +929,7 @@ final class AnnotationCanvasView: NSView {
 
     func commitTextIfNeeded() {
         guard let tf = textField else { return }
+        let before = currentSnapshot()
         let s = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let origin = textImageOrigin
         let editIdx = editingAnnoIndex
@@ -846,8 +952,10 @@ final class AnnotationCanvasView: NSView {
             annotations.remove(at: editIdx)
             selectedAnnoIndex = nil
         }
+        pushUndoSnapshot(before)
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
+        window?.makeFirstResponder(self)
         onEditingChanged?()
     }
 
@@ -864,6 +972,7 @@ final class AnnotationCanvasView: NSView {
         cropRect = nil
         selectedAnnoIndex = nil
         drag = .none
+        clearUndoStack()
         needsDisplay = true
     }
 
@@ -1634,6 +1743,7 @@ final class OverlayController: NSObject {
 
     private func hideEditor(restoreFloat: Bool) {
         canvas?.cancelTextEdit()
+        canvas?.clearUndoStack()
         isEditorOpen = false
         editorPanel?.orderOut(nil)
         if restoreFloat, floatImage != nil {
@@ -1724,6 +1834,7 @@ extension OverlayController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Treat as cancel if editor closed somehow
         if notification.object as AnyObject? === editorPanel {
+            canvas?.clearUndoStack()
             isEditorOpen = false
             if let img = editorBaseImage ?? floatImage {
                 floatImage = img
