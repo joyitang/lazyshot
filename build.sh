@@ -11,7 +11,7 @@ BIN="${MACOS}/${APP_NAME}"
 
 mkdir -p "${MACOS}" "${RESOURCES}"
 
-swiftc -O -framework AppKit -framework Foundation main.swift -o "${BIN}"
+swiftc -O -framework AppKit -framework Foundation -framework ServiceManagement main.swift -o "${BIN}"
 
 # Remove leftover bare binary from older builds (optional cleanup)
 if [[ -f MiniScreenshotOverlay ]]; then
@@ -108,9 +108,9 @@ cat > "${CONTENTS}/Info.plist" <<'PLIST'
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>

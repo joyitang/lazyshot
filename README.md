@@ -24,10 +24,11 @@ A tiny screenshot overlay for Mac.
 
 ## 安装
 
-1. 下载 `lazyshot.app`，或本地跑 `./build.sh`
-2. 放到「应用程序」或随便哪个文件夹都行
-3. 第一次若被系统拦住：在访达里对图标 **右键 → 打开**
-4. 看菜单栏有没有 lazyshot 图标
+1. **推荐**：打开 [Releases](https://github.com/joytang123/lazyshot/releases) 下载 `lazyshot-*-macos-arm64.zip`，解压得到 `lazyshot.app`
+2. 或本地跑 `./build.sh` 自己编译
+3. 放到「应用程序」或随便哪个文件夹都行
+4. 第一次若被系统拦住：在访达里对图标 **右键 → 打开**
+5. 看菜单栏有没有 lazyshot 图标
 
 ```bash
 git clone https://github.com/joytang123/lazyshot

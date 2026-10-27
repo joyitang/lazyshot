@@ -1,10 +1,91 @@
 import AppKit
 import Foundation
+import ServiceManagement
+
+// MARK: - Visible user alerts (permission / crash / missing app)
+
+/// Lightweight NSAlert with short-window dedupe so the same failure does not spam.
+enum UserAlert {
+    private static var lastShown: [String: Date] = [:]
+    private static let dedupeInterval: TimeInterval = 20
+
+    static func show(key: String, title: String, message: String) {
+        let present = {
+            let now = Date()
+            if let last = lastShown[key], now.timeIntervalSince(last) < dedupeInterval {
+                return
+            }
+            lastShown[key] = now
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = title
+            alert.informativeText = message
+            alert.addButton(withTitle: "好")
+            // LSUIElement accessory: briefly activate so the panel is visible.
+            NSApp.activate(ignoringOtherApps: true)
+            _ = alert.runModal()
+        }
+        if Thread.isMainThread {
+            present()
+        } else {
+            DispatchQueue.main.async(execute: present)
+        }
+    }
+
+    static func desktopReadFailed() {
+        show(
+            key: "desktop-read",
+            title: "无法读取桌面截图",
+            message: "可能未授权访问桌面。请到：系统设置 → 隐私与安全性 → 文件与文件夹（或完整磁盘访问权限），允许 lazyshot。"
+        )
+    }
+
+    static func desktopWriteFailed() {
+        show(
+            key: "desktop-write",
+            title: "无法保存到桌面",
+            message: "写入 lazyshot_*.png 失败。请到：系统设置 → 隐私与安全性 → 文件与文件夹，允许 lazyshot 访问桌面。"
+        )
+    }
+
+    static func loginItemFailed(enabling: Bool) {
+        let action = enabling ? "开启" : "关闭"
+        show(
+            key: "login-item",
+            title: "无法\(action)登录时启动",
+            message: "Login Item 注册失败。请确认通过 lazyshot.app 运行，或到：系统设置 → 通用 → 登录项，手动管理。"
+        )
+    }
+
+    static func appNotFound(label: String) {
+        show(
+            key: "app-missing-\(label)",
+            title: "未找到\(label)",
+            message: "本机未安装或无法打开 \(label)。请先安装后再试。"
+        )
+    }
+
+    static func appOpenFailed(label: String) {
+        show(
+            key: "app-open-\(label)",
+            title: "无法打开\(label)",
+            message: "已找到 \(label)，但唤起失败。可尝试手动打开后再分享。"
+        )
+    }
+
+    static func fatalProblem(detail: String) {
+        show(
+            key: "uncaught",
+            title: "lazyshot 遇到问题",
+            message: detail.isEmpty ? "发生未处理错误，应用可能不稳定。" : detail
+        )
+    }
+}
 
 // Shift-Command-4 → Desktop file → clipboard + delete original → Layer 1 float.
 // 浮窗仍在时可连截叠放（最多 5 张）；超时 / 存桌面 = 整摞落盘。
-// 剪裁 / 画笔 → Layer 2 compact editor → 取消/保存 back to float（只动顶图）。
-// Share: 复制整摞进剪贴板；存桌面整摞；飞书 / 微信分享顶图。
+// 剪裁 / 画笔 → Layer 2 compact editor → 取消/保存 back to float；上一张/下一张翻栈编辑；复制=带走当前张并结束预览。
+// Share: 浮窗「复制」整摞进剪贴板；存桌面整摞；飞书 / 微信分享顶图。
 
 // MARK: - Annotation model (image-space, bottom-left origin)
 
@@ -1015,6 +1096,21 @@ final class AnnotationCanvasView: NSView {
         needsDisplay = true
     }
 
+    /// True if the user has annotations, a real crop, undoable steps, or open text.
+    func hasPendingEdits() -> Bool {
+        if textField != nil { return true }
+        if !annotations.isEmpty { return true }
+        if !undoStack.isEmpty { return true }
+        if let cr = cropRect, let img = baseImage {
+            let full = NSRect(origin: .zero, size: img.size)
+            if abs(cr.minX - full.minX) >= 1 || abs(cr.minY - full.minY) >= 1
+                || abs(cr.width - full.width) >= 2 || abs(cr.height - full.height) >= 2 {
+                return true
+            }
+        }
+        return false
+    }
+
     func resetEdits() {
         cancelTextEdit()
         annotations.removeAll()
@@ -1216,6 +1312,9 @@ final class OverlayController: NSObject {
     private var editorChrome: NSView?
     private var toolbarDragRegion: ToolbarDragRegion?
     private var saveButton: NSButton?
+    private var editorCopyButton: NSButton?
+    private var editorPrevButton: NSButton?
+    private var editorNextButton: NSButton?
 
     /// Capture stack for Layer 1 float. Index 0 = oldest (bottom); last = top card.
     private var floatStack: [NSImage] = []
@@ -1225,8 +1324,10 @@ final class OverlayController: NSObject {
     private var badgeLabel: NSTextField?
     private var badgeHost: NSView?
     private var thumbContainer: NSView?
-    /// Snapshot when editor opened (for 取消) — top card only.
+    /// Snapshot of the card when it became the editor target (for 取消 on that card).
     private var editorBaseImage: NSImage?
+    /// Index into floatStack of the card currently in the editor (defaults to top on open).
+    private var editorStackIndex: Int = 0
 
     private let desktopURL: URL
 
@@ -1259,6 +1360,10 @@ final class OverlayController: NSObject {
 
     // Menu bar status item (LSUIElement accessory app)
     private var statusItem: NSStatusItem?
+    private var launchAtLoginMenuItem: NSMenuItem?
+
+    /// UserDefaults: nil = first run (default ON); true/false = user choice.
+    private static let launchAtLoginDefaultsKey = "launchAtLoginEnabled"
 
     // Float layout constants
     private let floatW: CGFloat = 148
@@ -1279,6 +1384,8 @@ final class OverlayController: NSObject {
         }
         NSApp.setActivationPolicy(.accessory)
         setupStatusItem()
+        applyDefaultLaunchAtLoginIfNeeded()
+        syncLaunchAtLoginMenuState()
     }
 
     private func seedKnownFiles() {
@@ -1324,6 +1431,15 @@ final class OverlayController: NSObject {
         let running = NSMenuItem(title: "lazyshot 运行中", action: nil, keyEquivalent: "")
         running.isEnabled = false
         menu.addItem(running)
+        menu.addItem(.separator())
+        let launch = NSMenuItem(
+            title: "登录时启动",
+            action: #selector(toggleLaunchAtLogin(_:)),
+            keyEquivalent: ""
+        )
+        launch.target = self
+        menu.addItem(launch)
+        launchAtLoginMenuItem = launch
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(quitFromStatusItem(_:)), keyEquivalent: "q")
         quit.target = self
@@ -1397,6 +1513,48 @@ final class OverlayController: NSObject {
         return candidates.first { fm.fileExists(atPath: $0.path) }
     }
 
+    // MARK: - Launch at login (SMAppService.mainApp, macOS 13+)
+
+    /// First run with no stored preference → default ON (lazy-tool habit).
+    private func applyDefaultLaunchAtLoginIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: Self.launchAtLoginDefaultsKey) == nil else { return }
+        defaults.set(true, forKey: Self.launchAtLoginDefaultsKey)
+        // Only meaningful inside a real .app; bare binary often fails — log and continue.
+        do {
+            try SMAppService.mainApp.register()
+            NSLog("launch at login: default ON, registered")
+        } catch {
+            NSLog("launch at login: default ON register failed (use lazyshot.app): \(error)")
+            UserAlert.loginItemFailed(enabling: true)
+        }
+    }
+
+    private func syncLaunchAtLoginMenuState() {
+        let on = SMAppService.mainApp.status == .enabled
+        launchAtLoginMenuItem?.state = on ? .on : .off
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: Any?) {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+                UserDefaults.standard.set(false, forKey: Self.launchAtLoginDefaultsKey)
+                NSLog("launch at login: OFF")
+            } else {
+                try service.register()
+                UserDefaults.standard.set(true, forKey: Self.launchAtLoginDefaultsKey)
+                NSLog("launch at login: ON")
+            }
+        } catch {
+            NSLog("launch at login toggle failed: \(error)")
+            let enabling = service.status != .enabled
+            UserAlert.loginItemFailed(enabling: enabling)
+        }
+        syncLaunchAtLoginMenuState()
+    }
+
     @objc private func quitFromStatusItem(_ sender: Any?) {
         // Remove status item first so the icon disappears immediately.
         if let item = statusItem {
@@ -1416,6 +1574,7 @@ final class OverlayController: NSObject {
         dirFD = open(desktopURL.path, O_EVTONLY)
         guard dirFD >= 0 else {
             NSLog("Cannot open Desktop for watching")
+            UserAlert.desktopReadFailed()
             return
         }
         let mask: DispatchSource.FileSystemEvent = [
@@ -1438,11 +1597,18 @@ final class OverlayController: NSObject {
 
     private func scanForNewScreenshot() {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(
-            at: desktopURL,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
+        let files: [URL]
+        do {
+            files = try fm.contentsOfDirectory(
+                at: desktopURL,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            NSLog("scan Desktop failed: \(error)")
+            UserAlert.desktopReadFailed()
+            return
+        }
 
         var newest: (URL, Date)?
         for url in files where isScreenshot(url) {
@@ -1510,6 +1676,8 @@ final class OverlayController: NSObject {
         guard attempt < 12 else {
             knownFiles.insert(name)
             pendingNames.remove(name)
+            NSLog("give up claiming screenshot: \(name)")
+            UserAlert.desktopReadFailed()
             return
         }
         retryWorkItems[name]?.cancel()
@@ -1561,11 +1729,16 @@ final class OverlayController: NSObject {
     private func topFloatImage() -> NSImage? { floatStack.last }
 
     private func replaceTopFloatImage(_ image: NSImage) {
+        replaceFloatImage(at: floatStack.count - 1, with: image)
+    }
+
+    private func replaceFloatImage(at index: Int, with image: NSImage) {
         if floatStack.isEmpty {
             floatStack = [image]
-        } else {
-            floatStack[floatStack.count - 1] = image
+            return
         }
+        guard floatStack.indices.contains(index) else { return }
+        floatStack[index] = image
     }
 
     /// Refresh thumbnail stack peeks + corner badge. Badge only when count > 1.
@@ -1808,6 +1981,24 @@ final class OverlayController: NSObject {
         return b
     }
 
+    /// Editor toolbar right cluster: pure SF Symbol icons (tooltip keeps Chinese).
+    private func makeEditorIconButton(symbol: String, tip: String, action: Selector, accent: Bool = false) -> NSButton {
+        let b = NSButton(title: "", target: self, action: action)
+        b.bezelStyle = .recessed
+        b.isBordered = false
+        b.setButtonType(.momentaryChange)
+        b.imagePosition = .imageOnly
+        b.toolTip = tip
+        b.setAccessibilityLabel(tip)
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: tip) {
+            let weight: NSFont.Weight = accent ? .semibold : .medium
+            let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: weight)
+            b.image = img.withSymbolConfiguration(cfg)
+        }
+        b.contentTintColor = accent ? .controlAccentColor : .labelColor
+        return b
+    }
+
     private func resetIdleDismissTimer() {
         dismissTimer?.invalidate()
         // Don't auto-dismiss while editor is open
@@ -1902,12 +2093,17 @@ final class OverlayController: NSObject {
     }
 
     private func openEditor(initialTool: AnnoTool) {
-        guard let image = topFloatImage() else { return }
+        guard !floatStack.isEmpty else { return }
+        // Default: edit current top card; 上一张/下一张 moves editorStackIndex.
+        let index = floatStack.count - 1
+        guard floatStack.indices.contains(index) else { return }
+        let image = floatStack[index]
         // Mid-dismiss click: abort exit animation; editor is temporary hide, not exit slide.
         cancelFloatDismissAnimation()
         dismissTimer?.invalidate()
         dismissTimer = nil
         isEditorOpen = true
+        editorStackIndex = index
         editorBaseImage = image
 
         if editorPanel == nil { buildEditorPanel() }
@@ -1916,6 +2112,7 @@ final class OverlayController: NSObject {
         canvas?.resetEdits()
         canvas?.tool = initialTool
         selectToolButton(tag: initialTool.rawValue)
+        updateEditorNavButtons()
 
         layoutEditorForImage(image)
         // Temporary yield for editor — NOT permanent exit (no slide-away).
@@ -1942,7 +2139,9 @@ final class OverlayController: NSObject {
         // Fit image into that box; allow modest upscale for small captures so tools stay precise
         let fit = min(maxW / iw, maxH / ih)
         let scale = min(max(fit, 0.35), 1.25)
-        let canvasW = min(maxW, max(420, iw * scale))
+        // Room for 上一张/下一张/复制 beside 取消/保存 without crowding tool pills.
+        let minCanvasW: CGFloat = floatStack.count > 1 ? 560 : 480
+        let canvasW = min(maxW, max(minCanvasW, iw * scale))
         let canvasH = min(maxH, max(280, ih * scale))
         let panelW = canvasW + 20
         let panelH = canvasH + chromeH + 10
@@ -1997,15 +2196,48 @@ final class OverlayController: NSObject {
             editorChrome?.addSubview(b) // keep above drag region
         }
 
-        let cancelW: CGFloat = 56
-        let saveW: CGFloat = 64
-        if let cancel = editorChrome?.viewWithTag(9001) {
-            cancel.frame = NSRect(x: panelW - side - saveW - gap - cancelW, y: toolY, width: cancelW, height: toolH)
-            editorChrome?.addSubview(cancel)
-        }
+        // Pure-icon right cluster — square hit targets
+        let cancelW: CGFloat = 32
+        let copyW: CGFloat = 32
+        let saveW: CGFloat = 32
+        let navW: CGFloat = 32
+        // Right cluster (trailing → leading): 保存 | 复制 | 取消 | 下一张 | 上一张
+        var rightX = panelW - side
         if let save = saveButton {
-            save.frame = NSRect(x: panelW - side - saveW, y: toolY, width: saveW, height: toolH)
+            rightX -= saveW
+            save.frame = NSRect(x: rightX, y: toolY, width: saveW, height: toolH)
             editorChrome?.addSubview(save)
+            rightX -= gap
+        }
+        if let copy = editorCopyButton {
+            rightX -= copyW
+            copy.frame = NSRect(x: rightX, y: toolY, width: copyW, height: toolH)
+            editorChrome?.addSubview(copy)
+            rightX -= gap
+        }
+        if let cancel = editorChrome?.viewWithTag(9001) {
+            rightX -= cancelW
+            cancel.frame = NSRect(x: rightX, y: toolY, width: cancelW, height: toolH)
+            editorChrome?.addSubview(cancel)
+            rightX -= gap
+        }
+        let showNav = floatStack.count > 1
+        if let next = editorNextButton {
+            next.isHidden = !showNav
+            if showNav {
+                rightX -= navW
+                next.frame = NSRect(x: rightX, y: toolY, width: navW, height: toolH)
+                editorChrome?.addSubview(next)
+                rightX -= gap
+            }
+        }
+        if let prev = editorPrevButton {
+            prev.isHidden = !showNav
+            if showNav {
+                rightX -= navW
+                prev.frame = NSRect(x: rightX, y: toolY, width: navW, height: toolH)
+                editorChrome?.addSubview(prev)
+            }
         }
     }
 
@@ -2074,24 +2306,33 @@ final class OverlayController: NSObject {
             toolButtons.append(b)
         }
 
-        let cancelBtn = NSButton(title: "取消", target: self, action: #selector(cancelEditor))
-        cancelBtn.bezelStyle = .recessed
-        cancelBtn.setButtonType(.momentaryPushIn)
-        cancelBtn.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let cancelBtn = makeEditorIconButton(symbol: "xmark", tip: "取消", action: #selector(cancelEditor))
         cancelBtn.tag = 9001
         chrome.addSubview(cancelBtn)
 
-        let saveBtn = NSButton(title: "保存", target: self, action: #selector(saveEditor))
-        saveBtn.bezelStyle = .rounded
+        let copyBtn = makeEditorIconButton(symbol: "doc.on.doc", tip: "复制", action: #selector(copyAndExitEditor))
+        chrome.addSubview(copyBtn)
+        self.editorCopyButton = copyBtn
+
+        let prevBtn = makeEditorIconButton(symbol: "chevron.left", tip: "上一张", action: #selector(editorPrevCard))
+        chrome.addSubview(prevBtn)
+        self.editorPrevButton = prevBtn
+
+        let nextBtn = makeEditorIconButton(symbol: "chevron.right", tip: "下一张", action: #selector(editorNextCard))
+        chrome.addSubview(nextBtn)
+        self.editorNextButton = nextBtn
+
+        let saveBtn = makeEditorIconButton(symbol: "checkmark", tip: "保存", action: #selector(saveEditor), accent: true)
         saveBtn.keyEquivalent = "\r"
-        saveBtn.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        saveBtn.bezelColor = .controlAccentColor
         chrome.addSubview(saveBtn)
         self.saveButton = saveBtn
 
         // Tools/actions above drag region so they still receive clicks
         for b in toolButtons { chrome.addSubview(b) }  // already added; ensure z-order
         if let cancel = chrome.viewWithTag(9001) { chrome.addSubview(cancel) }
+        if let copy = editorCopyButton { chrome.addSubview(copy) }
+        if let prev = editorPrevButton { chrome.addSubview(prev) }
+        if let next = editorNextButton { chrome.addSubview(next) }
         if let save = saveButton { chrome.addSubview(save) }
 
         panel.contentView = chrome
@@ -2119,10 +2360,10 @@ final class OverlayController: NSObject {
     }
 
     @objc private func cancelEditor() {
-        // Discard edits → float keeps original top card
+        // Discard edits on the current editor target only → back to float
         hideEditor(restoreFloat: true)
-        if let img = editorBaseImage ?? topFloatImage() {
-            replaceTopFloatImage(img)
+        if let img = editorBaseImage, floatStack.indices.contains(editorStackIndex) {
+            replaceFloatImage(at: editorStackIndex, with: img)
             updateStackVisuals()
         }
         resetIdleDismissTimer()
@@ -2134,8 +2375,75 @@ final class OverlayController: NSObject {
             return
         }
         canvas?.resetEdits()
+        let idx = editorStackIndex
         hideEditor(restoreFloat: true)
-        refreshFloatImage(result)
+        // Apply to the card that was being edited (may not be top).
+        replaceFloatImage(at: idx, with: result)
+        updateStackVisuals()
+        writePasteboard(result)
+        cancelFloatDismissAnimation()
+        if floatPanel == nil { buildFloatPanel() }
+        positionFloatBottomRight()
+        floatPanel?.alphaValue = 1
+        floatPanel?.ignoresMouseEvents = false
+        floatPanel?.orderFrontRegardless()
+        resetIdleDismissTimer()
+    }
+
+    /// Copy the card currently in the editor (with pending edits applied), then end the whole preview session.
+    @objc private func copyAndExitEditor() {
+        guard let result = canvas?.compositedImage() else {
+            hideEditor(restoreFloat: false)
+            hideFloat()
+            return
+        }
+        writePasteboard(result)
+        // Do not restore float — leave the preview chain entirely.
+        hideEditor(restoreFloat: false)
+        hideFloat()
+    }
+
+    @objc private func editorPrevCard() {
+        flipEditor(delta: -1)
+    }
+
+    @objc private func editorNextCard() {
+        flipEditor(delta: 1)
+    }
+
+    /// Flip editor target inside floatStack. Unsaved edits auto-apply (lazy path, no confirm).
+    private func flipEditor(delta: Int) {
+        guard floatStack.count > 1, isEditorOpen else { return }
+        let target = editorStackIndex + delta
+        guard floatStack.indices.contains(target) else { return }
+
+        // Auto-apply current card before leaving it.
+        if canvas?.hasPendingEdits() == true, let result = canvas?.compositedImage() {
+            replaceFloatImage(at: editorStackIndex, with: result)
+        } else {
+            canvas?.commitTextIfNeeded()
+        }
+
+        editorStackIndex = target
+        let image = floatStack[target]
+        editorBaseImage = image
+        let keepTool = canvas?.tool ?? .rect
+        canvas?.baseImage = image
+        canvas?.resetEdits()
+        canvas?.tool = keepTool
+        selectToolButton(tag: keepTool.rawValue)
+        updateEditorNavButtons()
+        layoutEditorForImage(image)
+        if let canvas { canvas.window?.invalidateCursorRects(for: canvas) }
+    }
+
+    private func updateEditorNavButtons() {
+        let n = floatStack.count
+        let show = n > 1
+        editorPrevButton?.isHidden = !show
+        editorNextButton?.isHidden = !show
+        editorPrevButton?.isEnabled = show && editorStackIndex > 0
+        editorNextButton?.isEnabled = show && editorStackIndex < n - 1
     }
 
     private func hideEditor(restoreFloat: Bool) {
@@ -2196,6 +2504,7 @@ final class OverlayController: NSObject {
                 savedAny = true
             } catch {
                 NSLog("save failed: \(error)")
+                UserAlert.desktopWriteFailed()
             }
         }
         if let top = floatStack.last {
@@ -2238,20 +2547,24 @@ final class OverlayController: NSObject {
         writePasteboard(image)
         hideFloat()
 
-        let ok = activateApp(bundleIDs: ids)
+        let ok = activateApp(bundleIDs: ids, label: label)
         if !ok {
             NSLog("share: could not open \(label)")
+            UserAlert.appNotFound(label: label)
         }
     }
 
-    private func activateApp(bundleIDs: [String]) -> Bool {
+    private func activateApp(bundleIDs: [String], label: String) -> Bool {
         let ws = NSWorkspace.shared
         for id in bundleIDs {
             if let urls = ws.urlForApplication(withBundleIdentifier: id) {
                 let config = NSWorkspace.OpenConfiguration()
                 config.activates = true
                 ws.openApplication(at: urls, configuration: config) { _, error in
-                    if let error { NSLog("open \(id) failed: \(error)") }
+                    if let error {
+                        NSLog("open \(id) failed: \(error)")
+                        UserAlert.appOpenFailed(label: label)
+                    }
                 }
                 return true
             }
@@ -2329,6 +2642,19 @@ extension OverlayController: NSWindowDelegate {
             positionFloatBottomRight()
             floatPanel?.orderFrontRegardless()
             resetIdleDismissTimer()
+        }
+    }
+}
+
+NSSetUncaughtExceptionHandler { exception in
+    let detail = "\(exception.name.rawValue): \(exception.reason ?? "")"
+    NSLog("uncaught exception: \(detail)")
+    // Present synchronously so the alert still appears before process teardown.
+    if Thread.isMainThread {
+        UserAlert.fatalProblem(detail: detail)
+    } else {
+        DispatchQueue.main.sync {
+            UserAlert.fatalProblem(detail: detail)
         }
     }
 }
