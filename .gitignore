@@ -1,3 +1,7 @@
 MiniScreenshotOverlay
+lazyshot.app/
 .DS_Store
 *.log
+main.swift.bak-pre-ux
+*.bak
+*.bak-*

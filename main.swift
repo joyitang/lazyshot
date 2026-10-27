@@ -2,8 +2,9 @@ import AppKit
 import Foundation
 
 // Shift-Command-4 → Desktop file → clipboard + delete original → Layer 1 float.
-// 剪裁 / 画笔 → Layer 2 compact editor → 取消/保存 back to float.
-// Share: 复制 / 存桌面 / 飞书 / 微信 on current float image.
+// 浮窗仍在时可连截叠放（最多 5 张）；超时 / 存桌面 = 整摞落盘。
+// 剪裁 / 画笔 → Layer 2 compact editor → 取消/保存 back to float（只动顶图）。
+// Share: 复制整摞进剪贴板；存桌面整摞；飞书 / 微信分享顶图。
 
 // MARK: - Annotation model (image-space, bottom-left origin)
 
@@ -35,6 +36,10 @@ enum CropHandle: CaseIterable {
     }
 }
 
+enum ArrowEndpoint {
+    case from, to
+}
+
 enum CanvasDrag {
     case none
     case createCrop
@@ -43,6 +48,7 @@ enum CanvasDrag {
     case createAnno
     case moveAnno(index: Int, startMouse: NSPoint, original: Annotation)
     case resizeAnnoRect(index: Int, handle: CropHandle, startMouse: NSPoint, startRect: NSRect)
+    case resizeAnnoArrow(index: Int, endpoint: ArrowEndpoint, startFrom: NSPoint, startTo: NSPoint)
 }
 
 final class AnnotationCanvasView: NSView {
@@ -479,6 +485,26 @@ final class AnnotationCanvasView: NSView {
         return nil
     }
 
+    private func hitAnnoArrowEndpoint(index: Int, at viewPt: NSPoint) -> ArrowEndpoint? {
+        guard case .arrow(let from, let to) = annotations[index] else { return nil }
+        let a = imageToView(from)
+        let b = imageToView(to)
+        let slop = handleSize
+        let dFrom = hypot(viewPt.x - a.x, viewPt.y - a.y)
+        let dTo = hypot(viewPt.x - b.x, viewPt.y - b.y)
+        if dFrom <= slop && dFrom <= dTo { return .from }
+        if dTo <= slop { return .to }
+        return nil
+    }
+
+    private func clampImagePoint(_ p: NSPoint) -> NSPoint {
+        let full = fullImageRect()
+        return NSPoint(
+            x: min(max(p.x, full.minX), full.maxX),
+            y: min(max(p.y, full.minY), full.maxY)
+        )
+    }
+
     private func resizedRect(start: NSRect, handle: CropHandle, deltaImage: NSPoint) -> NSRect {
         var minX = start.minX, maxX = start.maxX
         var minY = start.minY, maxY = start.maxY
@@ -679,6 +705,14 @@ final class AnnotationCanvasView: NSView {
                 drag = .resizeAnnoRect(index: idx, handle: h, startMouse: imgPt, startRect: ir)
                 return
             }
+            if let idx = selectedAnnoIndex,
+               case .arrow(let from, let to) = annotations[idx],
+               let ep = hitAnnoArrowEndpoint(index: idx, at: p),
+               viewToImage(p, clamp: true) != nil {
+                beginUndoGroup()
+                drag = .resizeAnnoArrow(index: idx, endpoint: ep, startFrom: from, startTo: to)
+                return
+            }
             if let idx = hitAnnotationIndex(at: p), let imgPt = viewToImage(p, clamp: true) {
                 selectedAnnoIndex = idx
                 beginUndoGroup()
@@ -730,6 +764,16 @@ final class AnnotationCanvasView: NSView {
             let d = NSPoint(x: imgPt.x - startMouse.x, y: imgPt.y - startMouse.y)
             guard annotations.indices.contains(index) else { return }
             annotations[index] = .rect(resizedRect(start: startRect, handle: handle, deltaImage: d))
+        case .resizeAnnoArrow(let index, let endpoint, let startFrom, let startTo):
+            guard let imgPt = viewToImage(p, clamp: true) else { return }
+            guard annotations.indices.contains(index) else { return }
+            let pImg = clampImagePoint(imgPt)
+            switch endpoint {
+            case .from:
+                annotations[index] = .arrow(from: pImg, to: startTo)
+            case .to:
+                annotations[index] = .arrow(from: startFrom, to: pImg)
+            }
         }
         onEditingChanged?()
     }
@@ -813,6 +857,11 @@ final class AnnotationCanvasView: NSView {
                     let minX = min(a.x, b.x) - 8, maxX = max(a.x, b.x) + 8
                     let minY = min(a.y, b.y) - 8, maxY = max(a.y, b.y) + 8
                     addCursorRect(NSRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY), cursor: .openHand)
+                    let hs: CGFloat = 12
+                    for hp in [a, b] {
+                        let hr = NSRect(x: hp.x - hs / 2, y: hp.y - hs / 2, width: hs, height: hs)
+                        addCursorRect(hr, cursor: .crosshair)
+                    }
                 case .text(let string, let origin, let fontSize):
                     let font = NSFont.boldSystemFont(ofSize: fontSize * viewFontScale())
                     let size = (string as NSString).size(withAttributes: [.font: font])
@@ -1138,6 +1187,20 @@ final class ToolPillButton: NSButton {
     }
 }
 
+
+/// NSTextField draws text high in tall bounds; badge circles need true vertical center.
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        let ideal = cellSize(forBounds: rect)
+        var r = super.drawingRect(forBounds: rect)
+        if r.height > ideal.height {
+            r.origin.y += (r.height - ideal.height) / 2
+            r.size.height = ideal.height
+        }
+        return r
+    }
+}
+
 // MARK: - Controller
 
 final class OverlayController: NSObject {
@@ -1154,9 +1217,15 @@ final class OverlayController: NSObject {
     private var toolbarDragRegion: ToolbarDragRegion?
     private var saveButton: NSButton?
 
-    /// Image currently shown in the float (original or last saved edit).
-    private var floatImage: NSImage?
-    /// Snapshot when editor opened (for 取消).
+    /// Capture stack for Layer 1 float. Index 0 = oldest (bottom); last = top card.
+    private var floatStack: [NSImage] = []
+    private let maxStackCount = 5
+    /// Up to 2 peeks behind the top thumbnail (visual stack only).
+    private var stackBehindViews: [NSImageView] = []
+    private var badgeLabel: NSTextField?
+    private var badgeHost: NSView?
+    private var thumbContainer: NSView?
+    /// Snapshot when editor opened (for 取消) — top card only.
     private var editorBaseImage: NSImage?
 
     private let desktopURL: URL
@@ -1171,12 +1240,25 @@ final class OverlayController: NSObject {
     private var ignorePasteboardUntil: Date?
     /// More reliable than NSPanel.isVisible for accessory panels.
     private var isEditorOpen = false
+    /// True while float exit animation is running (permanent dismiss only).
+    private var isDismissingFloat = false
+    /// Bumped to invalidate in-flight dismiss completion (e.g. new capture).
+    private var floatDismissGeneration = 0
+
+    // Exit animation (system-screenshot-thumbnail-like: slide BR + mild shrink/fade)
+    private let floatDismissDuration: TimeInterval = 0.36
+    private let floatDismissScale: CGFloat = 0.88
+    private let floatDismissSlideX: CGFloat = 56
+    private let floatDismissSlideY: CGFloat = 48
 
     /// Float auto-dismiss; paused while editor is open.
     private let idleDismissSeconds: TimeInterval = 6
 
     private let feishuBundleIDs = ["com.electron.lark", "com.larksuite.lark", "com.bytedance.macos.feishu"]
     private let wechatBundleIDs = ["com.tencent.xinWeChat"]
+
+    // Menu bar status item (LSUIElement accessory app)
+    private var statusItem: NSStatusItem?
 
     // Float layout constants
     private let floatW: CGFloat = 148
@@ -1196,6 +1278,7 @@ final class OverlayController: NSObject {
             self?.scanForNewScreenshot()
         }
         NSApp.setActivationPolicy(.accessory)
+        setupStatusItem()
     }
 
     private func seedKnownFiles() {
@@ -1214,11 +1297,119 @@ final class OverlayController: NSObject {
         let name = url.lastPathComponent
         if name.hasPrefix(".") { return false }
         if name.hasPrefix("截屏浮窗") { return false }
+        if name.hasPrefix("lazyshot") { return false }  // lazyshot_… 自存桌面，勿二次弹浮窗
         let ext = url.pathExtension.lowercased()
         guard ["png", "jpg", "jpeg"].contains(ext) else { return false }
         return name.hasPrefix("截屏")
             || name.hasPrefix("Screenshot")
             || name.hasPrefix("Screen Shot")
+    }
+
+    // MARK: - Menu bar status item
+
+    private func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            if let icon = loadMenubarTemplateImage() {
+                button.image = icon
+                button.imagePosition = .imageOnly
+            } else {
+                // Last-resort visible glyph if assets missing
+                button.title = "LS"
+            }
+            button.toolTip = "lazyshot"
+        }
+
+        let menu = NSMenu()
+        let running = NSMenuItem(title: "lazyshot 运行中", action: nil, keyEquivalent: "")
+        running.isEnabled = false
+        menu.addItem(running)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出", action: #selector(quitFromStatusItem(_:)), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        item.menu = menu
+        statusItem = item
+    }
+
+    /// Bundle Resources first; fall back to project `assets/` when running unpackaged (swiftc binary).
+    private func loadMenubarTemplateImage() -> NSImage? {
+        let names = [
+            ("lazyshot_menubar_16", 16),  // 16px → 16pt @1x
+            ("lazyshot_menubar_32", 16),  // 32px → 16pt @2x
+            ("lazyshot_menubar_64", 16),  // 64px → 16pt @4x
+        ]
+        let image = NSImage()
+        image.isTemplate = true
+        var added = false
+        for (base, pointSize) in names {
+            guard let url = resolveBundledOrDevResource(base: base, ext: "png"),
+                  let src = NSImage(contentsOf: url),
+                  let tiff = src.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff) else { continue }
+            rep.size = NSSize(width: pointSize, height: pointSize)
+            image.addRepresentation(rep)
+            added = true
+        }
+        guard added else {
+            NSLog("menubar icon: no template PNGs found (Bundle or assets/ fallback)")
+            return nil
+        }
+        // Status bar prefers ~18pt slot; keep content at 16pt and let AppKit center it.
+        image.size = NSSize(width: 16, height: 16)
+        image.isTemplate = true
+        return image
+    }
+
+    private func resolveBundledOrDevResource(base: String, ext: String) -> URL? {
+        if let url = Bundle.main.url(forResource: base, withExtension: ext) {
+            return url
+        }
+        let fm = FileManager.default
+        var candidates: [URL] = []
+        // CWD/assets (typical when developing from project root)
+        candidates.append(
+            URL(fileURLWithPath: fm.currentDirectoryPath)
+                .appendingPathComponent("assets")
+                .appendingPathComponent("\(base).\(ext)")
+        )
+        // Sibling of .app: …/mini-screenshot-overlay/assets/…
+        let bundle = Bundle.main.bundleURL
+        candidates.append(
+            bundle.deletingLastPathComponent()
+                .appendingPathComponent("assets")
+                .appendingPathComponent("\(base).\(ext)")
+        )
+        // If Bundle.main is the raw executable (not inside .app)
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        candidates.append(
+            exe.deletingLastPathComponent()
+                .appendingPathComponent("assets")
+                .appendingPathComponent("\(base).\(ext)")
+        )
+        candidates.append(
+            exe.deletingLastPathComponent() // MacOS
+                .deletingLastPathComponent() // Contents
+                .deletingLastPathComponent() // .app
+                .appendingPathComponent("assets")
+                .appendingPathComponent("\(base).\(ext)")
+        )
+        return candidates.first { fm.fileExists(atPath: $0.path) }
+    }
+
+    @objc private func quitFromStatusItem(_ sender: Any?) {
+        // Remove status item first so the icon disappears immediately.
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItem = nil
+        }
+        dismissTimer?.invalidate()
+        dismissTimer = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
+        watcher?.cancel()
+        watcher = nil
+        NSApp.terminate(nil)
     }
 
     private func startWatching() {
@@ -1334,23 +1525,72 @@ final class OverlayController: NSObject {
     private func showFloat(image: NSImage) {
         // Close editor if open (new capture wins)
         hideEditor(restoreFloat: false)
-        floatImage = image
+        cancelFloatDismissAnimation()
+        // Float session still alive (incl. mid-dismiss) → stack; else start fresh.
+        if floatStack.isEmpty {
+            floatStack = [image]
+        } else {
+            floatStack.append(image)
+            if floatStack.count > maxStackCount {
+                floatStack.removeFirst(floatStack.count - maxStackCount)
+            }
+        }
         if floatPanel == nil { buildFloatPanel() }
-        thumbView?.image = image
+        updateStackVisuals()
         positionFloatBottomRight()
+        floatPanel?.alphaValue = 1
+        floatPanel?.ignoresMouseEvents = false
         floatPanel?.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) + 1)
         floatPanel?.orderFrontRegardless()
         resetIdleDismissTimer()
     }
 
     private func refreshFloatImage(_ image: NSImage) {
-        floatImage = image
-        thumbView?.image = image
+        cancelFloatDismissAnimation()
+        replaceTopFloatImage(image)
         writePasteboard(image)
         if floatPanel == nil { buildFloatPanel() }
+        updateStackVisuals()
         positionFloatBottomRight()
+        floatPanel?.alphaValue = 1
+        floatPanel?.ignoresMouseEvents = false
         floatPanel?.orderFrontRegardless()
         resetIdleDismissTimer()
+    }
+
+    private func topFloatImage() -> NSImage? { floatStack.last }
+
+    private func replaceTopFloatImage(_ image: NSImage) {
+        if floatStack.isEmpty {
+            floatStack = [image]
+        } else {
+            floatStack[floatStack.count - 1] = image
+        }
+    }
+
+    /// Refresh thumbnail stack peeks + corner badge. Badge only when count > 1.
+    private func updateStackVisuals() {
+        let top = floatStack.last
+        thumbView?.image = top
+
+        // behind[0] = card just under top; behind[1] = one deeper
+        let behindCount = min(max(floatStack.count - 1, 0), stackBehindViews.count)
+        for (i, view) in stackBehindViews.enumerated() {
+            if i < behindCount {
+                let idx = floatStack.count - 2 - i
+                view.image = floatStack[idx]
+                view.isHidden = false
+            } else {
+                view.image = nil
+                view.isHidden = true
+            }
+        }
+
+        if let badge = badgeLabel {
+            let n = floatStack.count
+            badge.stringValue = "\(n)"
+            badgeHost?.isHidden = n <= 1
+        }
     }
 
     private func positionFloatBottomRight() {
@@ -1404,17 +1644,105 @@ final class OverlayController: NSObject {
         chrome.addSubview(cropBtn)
         chrome.addSubview(brushBtn)
 
-        // Thumbnail
+        // Thumbnail stack (behind peeks + top card + count badge)
         let thumbY = pad + shareH + gap
         let thumbH = h - pad - iconRowH - gap - thumbY
-        let thumb = NSImageView(frame: NSRect(x: pad, y: thumbY, width: w - pad * 2, height: max(thumbH, 40)))
+        let area = NSRect(x: pad, y: thumbY, width: w - pad * 2, height: max(thumbH, 40))
+        let container = NSView(frame: area)
+        container.wantsLayer = true
+
+        let peek: CGFloat = 4
+        // Inset top card so behind peeks stay inside chrome
+        let topFrame = NSRect(
+            x: 0,
+            y: peek * 2,
+            width: area.width - peek * 2,
+            height: area.height - peek * 2
+        )
+
+        var behinds: [NSImageView] = []
+        // Draw back-to-front: deeper card first
+        for depth in [2, 1] {
+            let dx = peek * CGFloat(depth)
+            let dy = peek * CGFloat(depth)
+            let frame = NSRect(
+                x: topFrame.minX + dx,
+                y: topFrame.minY - dy,
+                width: topFrame.width,
+                height: topFrame.height
+            )
+            let behind = NSImageView(frame: frame)
+            behind.imageScaling = .scaleProportionallyUpOrDown
+            behind.wantsLayer = true
+            behind.layer?.cornerRadius = 8
+            behind.layer?.masksToBounds = true
+            behind.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.15).cgColor
+            behind.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+            behind.layer?.borderWidth = 0.5
+            behind.isHidden = true
+            container.addSubview(behind)
+            behinds.append(behind)
+        }
+        // behinds currently [depth2, depth1]; updateStackVisuals expects [justUnderTop, deeper]
+        behinds.reverse()
+
+        let thumb = NSImageView(frame: topFrame)
         thumb.imageScaling = .scaleProportionallyUpOrDown
         thumb.wantsLayer = true
         thumb.layer?.cornerRadius = 8
         thumb.layer?.masksToBounds = true
         thumb.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.2).cgColor
-        chrome.addSubview(thumb)
+        thumb.layer?.borderColor = NSColor.white.withAlphaComponent(0.45).cgColor
+        thumb.layer?.borderWidth = 0.5
+        container.addSubview(thumb)
+
+        let badgeSize: CGFloat = 20
+        // Circle host + centered label: NSTextField alone pins digits high in the round.
+        let badgeHost = NSView(frame: NSRect(
+            x: topFrame.maxX - badgeSize + 2,
+            y: topFrame.maxY - badgeSize + 2,
+            width: badgeSize,
+            height: badgeSize
+        ))
+        badgeHost.wantsLayer = true
+        badgeHost.layer?.cornerRadius = badgeSize / 2
+        badgeHost.layer?.masksToBounds = true
+        // macOS-style stack count: light gray pill, not unread-notification red
+        badgeHost.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+        badgeHost.layer?.borderWidth = 0.5
+        badgeHost.layer?.borderColor = NSColor.separatorColor.cgColor
+        badgeHost.isHidden = true
+
+        let badgeCell = VerticallyCenteredTextFieldCell(textCell: "1")
+        badgeCell.isEditable = false
+        badgeCell.isSelectable = false
+        badgeCell.isBordered = false
+        badgeCell.drawsBackground = false
+        badgeCell.alignment = .center
+        badgeCell.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        badgeCell.textColor = .secondaryLabelColor
+        let badge = NSTextField(frame: NSRect(x: 0, y: 0, width: badgeSize, height: badgeSize))
+        badge.cell = badgeCell
+        badge.isBezeled = false
+        badge.isBordered = false
+        badge.drawsBackground = false
+        badge.isEditable = false
+        badge.isSelectable = false
+        badge.alignment = .center
+        badge.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        badge.textColor = .secondaryLabelColor
+        badge.usesSingleLineMode = true
+        badge.maximumNumberOfLines = 1
+        badge.lineBreakMode = .byClipping
+        badgeHost.addSubview(badge)
+        container.addSubview(badgeHost)
+
+        chrome.addSubview(container)
+        self.thumbContainer = container
+        self.stackBehindViews = behinds
         self.thumbView = thumb
+        self.badgeHost = badgeHost
+        self.badgeLabel = badge
 
         // Bottom 2×2: 复制 / 存桌面 / 飞书 / 微信
         let shares: [(String, String, Selector)] = [
@@ -1486,15 +1814,81 @@ final class OverlayController: NSObject {
         if isEditorOpen { return }
         dismissTimer = Timer.scheduledTimer(withTimeInterval: idleDismissSeconds, repeats: false) { [weak self] _ in
             guard let self, !self.isEditorOpen else { return }
-            // Timeout = clipboard only (already written on capture / save)
+            // Timeout = save entire stack to Desktop, then slide away
+            self.saveEntireStackToDesktop()
             self.hideFloat()
         }
     }
 
+    /// Permanent dismiss: slide toward bottom-right outside, then orderOut.
+    /// Temporary hide for editor uses `floatPanel?.orderOut` directly (no slide).
     private func hideFloat() {
         dismissTimer?.invalidate()
         dismissTimer = nil
-        floatPanel?.orderOut(nil)
+
+        guard let panel = floatPanel else { return }
+        // Re-entrant / stacked triggers: keep the first animation, ignore the rest.
+        if isDismissingFloat { return }
+
+        // Already off-screen — just clean state.
+        if !panel.isVisible {
+            finishFloatDismiss(panel: panel)
+            return
+        }
+
+        isDismissingFloat = true
+        floatDismissGeneration += 1
+        let generation = floatDismissGeneration
+        panel.ignoresMouseEvents = true
+
+        let start = panel.frame
+        let newW = start.width * floatDismissScale
+        let newH = start.height * floatDismissScale
+        // Anchor toward bottom-right: right edge moves further right, bottom further down.
+        let endFrame = NSRect(
+            x: start.maxX + floatDismissSlideX - newW,
+            y: start.minY - floatDismissSlideY,
+            width: newW,
+            height: newH
+        )
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = floatDismissDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            ctx.allowsImplicitAnimation = true
+            panel.animator().alphaValue = 0
+            panel.animator().setFrame(endFrame, display: true)
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            // A newer show/cancel invalidated this run.
+            guard self.floatDismissGeneration == generation else { return }
+            self.finishFloatDismiss(panel: panel)
+        })
+    }
+
+    private func finishFloatDismiss(panel: NSPanel) {
+        panel.orderOut(nil)
+        panel.alphaValue = 1
+        panel.ignoresMouseEvents = false
+        // Frame is restored on next show via positionFloatBottomRight().
+        isDismissingFloat = false
+        floatStack.removeAll()
+        updateStackVisuals()
+    }
+
+    /// Abort in-flight exit animation (new capture / restore float). Does not orderOut.
+    private func cancelFloatDismissAnimation() {
+        guard isDismissingFloat else { return }
+        floatDismissGeneration += 1
+        isDismissingFloat = false
+        if let panel = floatPanel {
+            // Snap animator properties to final non-dismissed visuals.
+            NSAnimationContext.beginGrouping()
+            NSAnimationContext.current.duration = 0
+            panel.alphaValue = 1
+            panel.ignoresMouseEvents = false
+            NSAnimationContext.endGrouping()
+        }
     }
 
     // MARK: Layer 2 — compact editor
@@ -1508,7 +1902,9 @@ final class OverlayController: NSObject {
     }
 
     private func openEditor(initialTool: AnnoTool) {
-        guard let image = floatImage else { return }
+        guard let image = topFloatImage() else { return }
+        // Mid-dismiss click: abort exit animation; editor is temporary hide, not exit slide.
+        cancelFloatDismissAnimation()
         dismissTimer?.invalidate()
         dismissTimer = nil
         isEditorOpen = true
@@ -1522,7 +1918,8 @@ final class OverlayController: NSObject {
         selectToolButton(tag: initialTool.rawValue)
 
         layoutEditorForImage(image)
-        // Hide float while editing
+        // Temporary yield for editor — NOT permanent exit (no slide-away).
+        floatPanel?.alphaValue = 1
         floatPanel?.orderOut(nil)
 
         editorPanel?.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) + 2)
@@ -1722,11 +2119,11 @@ final class OverlayController: NSObject {
     }
 
     @objc private func cancelEditor() {
-        // Discard edits → float keeps original
+        // Discard edits → float keeps original top card
         hideEditor(restoreFloat: true)
-        if let img = editorBaseImage ?? floatImage {
-            floatImage = img
-            thumbView?.image = img
+        if let img = editorBaseImage ?? topFloatImage() {
+            replaceTopFloatImage(img)
+            updateStackVisuals()
         }
         resetIdleDismissTimer()
     }
@@ -1746,41 +2143,85 @@ final class OverlayController: NSObject {
         canvas?.clearUndoStack()
         isEditorOpen = false
         editorPanel?.orderOut(nil)
-        if restoreFloat, floatImage != nil {
+        if restoreFloat, topFloatImage() != nil {
+            cancelFloatDismissAnimation()
             positionFloatBottomRight()
+            floatPanel?.alphaValue = 1
+            floatPanel?.ignoresMouseEvents = false
             floatPanel?.orderFrontRegardless()
         }
     }
 
-    // MARK: Share actions (operate on float image)
+    // MARK: Share actions (operate on float stack / top card)
 
     @objc private func keepClipboard() {
-        guard let image = floatImage else {
+        // Copy entire float stack to pasteboard, then dismiss (same hideFloat path as before).
+        guard !floatStack.isEmpty else {
             hideFloat()
             return
         }
-        writePasteboard(image)
+        if floatStack.count == 1, let image = floatStack.first {
+            writePasteboard(image)
+        } else {
+            writePasteboardStack(floatStack)
+        }
         hideFloat()
     }
 
     @objc private func saveToDesktop() {
-        guard let image = floatImage else { return }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-        let name = "截屏浮窗 \(formatter.string(from: Date())).png"
-        let dest = desktopURL.appendingPathComponent(name)
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:]) else { return }
-        do {
-            try png.write(to: dest)
-            knownFiles.insert(name)
-        } catch {
-            NSLog("save failed: \(error)")
-            return
-        }
-        writePasteboard(image)
+        guard topFloatImage() != nil else { return }
+        saveEntireStackToDesktop()
         hideFloat()
+    }
+
+    /// Write every card in the stack as `lazyshot_MMddHHmm.png` (+ `-2`/`-3`… on same-second / name clash).
+    @discardableResult
+    private func saveEntireStackToDesktop() -> Bool {
+        guard !floatStack.isEmpty else { return false }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMddHHmm"
+        formatter.timeZone = TimeZone.current  // 系统本地时区
+        let stamp = formatter.string(from: Date())
+        var nextSuffix = 0  // 0/1 → bare name; then 2, 3, …
+        var savedAny = false
+
+        for image in floatStack {
+            guard let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) else { continue }
+            let (dest, name) = uniqueLazyshotDestination(stamp: stamp, nextSuffix: &nextSuffix)
+            do {
+                try png.write(to: dest)
+                knownFiles.insert(name)
+                savedAny = true
+            } catch {
+                NSLog("save failed: \(error)")
+            }
+        }
+        if let top = floatStack.last {
+            writePasteboard(top)
+        }
+        return savedAny
+    }
+
+    /// Allocates a free Desktop path. Mutates `nextSuffix` so the following call continues the sequence.
+    private func uniqueLazyshotDestination(stamp: String, nextSuffix: inout Int) -> (URL, String) {
+        let fm = FileManager.default
+        while true {
+            let name: String
+            if nextSuffix <= 1 {
+                name = "lazyshot_\(stamp).png"
+            } else {
+                name = "lazyshot_\(stamp)-\(nextSuffix).png"
+            }
+            let dest = desktopURL.appendingPathComponent(name)
+            if !fm.fileExists(atPath: dest.path) {
+                // After bare name, subsequent files start at -2.
+                nextSuffix = max(nextSuffix + 1, 2)
+                return (dest, name)
+            }
+            nextSuffix = max(nextSuffix + 1, 2)
+        }
     }
 
     @objc private func shareFeishu() {
@@ -1792,7 +2233,8 @@ final class OverlayController: NSObject {
     }
 
     private func share(toBundleIDs ids: [String], label: String) {
-        guard let image = floatImage else { return }
+        // Minimal: share top card via clipboard; dismiss (stack not auto-saved).
+        guard let image = topFloatImage() else { return }
         writePasteboard(image)
         hideFloat()
 
@@ -1828,6 +2270,50 @@ final class OverlayController: NSObject {
         pb.clearContents()
         pb.writeObjects([image])
     }
+
+    /// Multi-image clipboard: one `NSPasteboardItem` per card (tiff + png), plus temp `fileURL`s
+    /// so Finder / some chat apps can paste the whole stack. Capture order = floatStack (oldest → top).
+    private func writePasteboardStack(_ images: [NSImage]) {
+        ignorePasteboardUntil = Date().addingTimeInterval(0.8)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard !images.isEmpty else { return }
+        if images.count == 1, let only = images.first {
+            pb.writeObjects([only])
+            return
+        }
+
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory
+            .appendingPathComponent("lazyshot-pb-\(ProcessInfo.processInfo.globallyUniqueString)", isDirectory: true)
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            NSLog("clipboard temp dir failed: \(error)")
+        }
+
+        var items: [NSPasteboardItem] = []
+        for (i, image) in images.enumerated() {
+            guard let tiff = image.tiffRepresentation else { continue }
+            let item = NSPasteboardItem()
+            item.setData(tiff, forType: .tiff)
+            if let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                item.setData(png, forType: .png)
+                let url = dir.appendingPathComponent(String(format: "lazyshot-%02d.png", i + 1))
+                do {
+                    try png.write(to: url)
+                    item.setString(url.absoluteString, forType: .fileURL)
+                } catch {
+                    NSLog("clipboard temp write failed: \(error)")
+                }
+            }
+            items.append(item)
+        }
+        if !items.isEmpty {
+            pb.writeObjects(items)
+        }
+    }
 }
 
 extension OverlayController: NSWindowDelegate {
@@ -1836,9 +2322,9 @@ extension OverlayController: NSWindowDelegate {
         if notification.object as AnyObject? === editorPanel {
             canvas?.clearUndoStack()
             isEditorOpen = false
-            if let img = editorBaseImage ?? floatImage {
-                floatImage = img
-                thumbView?.image = img
+            if let img = editorBaseImage ?? topFloatImage() {
+                replaceTopFloatImage(img)
+                updateStackVisuals()
             }
             positionFloatBottomRight()
             floatPanel?.orderFrontRegardless()
