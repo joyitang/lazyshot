@@ -31,7 +31,7 @@ A tiny screenshot overlay for Mac.
 
 ```bash
 git clone https://github.com/joytang123/lazyshot
-cd lazyshot   # 以实际仓库名为准
+cd lazyshot
 ./build.sh
 open ./lazyshot.app
 ```
