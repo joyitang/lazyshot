@@ -85,7 +85,7 @@ enum UserAlert {
 // Shift-Command-4 → Desktop file → clipboard + delete original → Layer 1 float.
 // 浮窗仍在时可连截叠放（最多 5 张）；超时 / 存桌面 = 整摞落盘。
 // 剪裁 / 画笔 → Layer 2 compact editor → 取消/保存 back to float；上一张/下一张翻栈编辑；复制=带走当前张并结束预览。
-// Share: 浮窗「复制」整摞进剪贴板；存桌面整摞；飞书 / 微信分享顶图。
+// Share: 浮窗「复制」/⌘C 整摞进剪贴板；存桌面整摞；飞书 / 微信分享顶图。
 
 // MARK: - Annotation model (image-space, bottom-left origin)
 
@@ -1343,6 +1343,8 @@ final class OverlayController: NSObject {
     private var isEditorOpen = false
     /// True while float exit animation is running (permanent dismiss only).
     private var isDismissingFloat = false
+    /// Local keyDown monitor for float toolbar hotkeys (⌘C → keepClipboard).
+    private var floatKeyMonitor: Any?
     /// Bumped to invalidate in-flight dismiss completion (e.g. new capture).
     private var floatDismissGeneration = 0
 
@@ -1709,7 +1711,7 @@ final class OverlayController: NSObject {
         floatPanel?.alphaValue = 1
         floatPanel?.ignoresMouseEvents = false
         floatPanel?.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) + 1)
-        floatPanel?.orderFrontRegardless()
+        activateFloatForHotkeys()
         resetIdleDismissTimer()
     }
 
@@ -1722,7 +1724,7 @@ final class OverlayController: NSObject {
         positionFloatBottomRight()
         floatPanel?.alphaValue = 1
         floatPanel?.ignoresMouseEvents = false
-        floatPanel?.orderFrontRegardless()
+        activateFloatForHotkeys()
         resetIdleDismissTimer()
     }
 
@@ -1792,7 +1794,8 @@ final class OverlayController: NSObject {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) + 1)
-        panel.becomesKeyOnlyIfNeeded = true
+        // Allow makeKey so float toolbar hotkeys (⌘C) work without a prior click.
+        panel.becomesKeyOnlyIfNeeded = false
 
         let chrome = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         chrome.material = .hudWindow
@@ -1934,12 +1937,49 @@ final class OverlayController: NSObject {
             let x = pad + CGFloat(col) * (cellW + gap)
             let b = makeFloatIconButton(title: item.0, symbol: item.1, action: item.2)
             b.frame = NSRect(x: x, y: y, width: cellW, height: cellH)
+            if item.0 == "复制" {
+                // Belt-and-suspenders with local monitor; icon+subviews alone are flaky.
+                b.keyEquivalent = "c"
+                b.keyEquivalentModifierMask = [.command]
+                b.toolTip = "复制 ⌘C"
+            }
             chrome.addSubview(b)
         }
 
         panel.contentView = chrome
         self.floatChrome = chrome
         self.floatPanel = panel
+    }
+
+    /// Make float key + briefly activate so toolbar hotkeys work right after capture (no click needed).
+    private func activateFloatForHotkeys() {
+        guard !isEditorOpen else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        floatPanel?.makeKeyAndOrderFront(nil)
+        installFloatHotkeyMonitor()
+    }
+
+    private func installFloatHotkeyMonitor() {
+        removeFloatHotkeyMonitor()
+        floatKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            guard !self.isEditorOpen, !self.floatStack.isEmpty, !self.isDismissingFloat else {
+                return event
+            }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let chord = mods.intersection([.command, .shift, .option, .control])
+            guard chord == .command else { return event }
+            guard event.charactersIgnoringModifiers?.lowercased() == "c" else { return event }
+            self.keepClipboard()
+            return nil
+        }
+    }
+
+    private func removeFloatHotkeyMonitor() {
+        if let monitor = floatKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            floatKeyMonitor = nil
+        }
     }
 
     private func makeFloatIconButton(title: String, symbol: String, action: Selector) -> NSButton {
@@ -2016,6 +2056,7 @@ final class OverlayController: NSObject {
     private func hideFloat() {
         dismissTimer?.invalidate()
         dismissTimer = nil
+        removeFloatHotkeyMonitor()
 
         guard let panel = floatPanel else { return }
         // Re-entrant / stacked triggers: keep the first animation, ignore the rest.
@@ -2058,6 +2099,7 @@ final class OverlayController: NSObject {
     }
 
     private func finishFloatDismiss(panel: NSPanel) {
+        removeFloatHotkeyMonitor()
         panel.orderOut(nil)
         panel.alphaValue = 1
         panel.ignoresMouseEvents = false
@@ -2103,6 +2145,7 @@ final class OverlayController: NSObject {
         dismissTimer?.invalidate()
         dismissTimer = nil
         isEditorOpen = true
+        removeFloatHotkeyMonitor()
         editorStackIndex = index
         editorBaseImage = image
 
@@ -2386,7 +2429,7 @@ final class OverlayController: NSObject {
         positionFloatBottomRight()
         floatPanel?.alphaValue = 1
         floatPanel?.ignoresMouseEvents = false
-        floatPanel?.orderFrontRegardless()
+        activateFloatForHotkeys()
         resetIdleDismissTimer()
     }
 
@@ -2456,7 +2499,7 @@ final class OverlayController: NSObject {
             positionFloatBottomRight()
             floatPanel?.alphaValue = 1
             floatPanel?.ignoresMouseEvents = false
-            floatPanel?.orderFrontRegardless()
+            activateFloatForHotkeys()
         }
     }
 
@@ -2640,7 +2683,7 @@ extension OverlayController: NSWindowDelegate {
                 updateStackVisuals()
             }
             positionFloatBottomRight()
-            floatPanel?.orderFrontRegardless()
+            activateFloatForHotkeys()
             resetIdleDismissTimer()
         }
     }
